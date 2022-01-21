@@ -1,0 +1,188 @@
+stages:
+        - build
+        - test
+        - push_feature
+        - push
+        - deploy_feature
+        - deploy
+
+variables:
+        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+        AWS_REPOSITORY: 111111111.dkr.ecr.eu-west-3.amazonaws.com
+        DOCKER_DRIVER: overlay2
+        DOCKER_HOST: tcp://docker:2376
+        DOCKER_TLS_CERTDIR: "/certs" 
+        APP: web-app
+        CLUSTER_TEST: fargate-web-test
+        CLUSTER_PROD: fargate-web    
+        REGION: eu-west-3
+        DOCKER_BUILDKIT: 1
+
+##########################################################################
+#                             BUILD                                      #
+##########################################################################
+
+build:
+  stage: build
+  services:
+          - docker:20.10.12-dind
+  before_script:
+          - echo "Login in $CI_REGISTRY..."
+          - echo -n $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+          - docker info | grep "Server Version"     
+          - aws ecr get-login-password --region eu-west-3 | docker login --username AWS --password-stdin $AWS_REPOSITORY
+  script:
+          - echo "Build image for $APP"
+          - echo "$CI_PIPELINE_IID"
+          - docker pull $AWS_REPOSITORY/$APP:latest || true
+          - docker build --cache-from $AWS_REPOSITORY/$APP:latest -t $AWS_REPOSITORY/$APP:$CI_COMMIT_SHORT_SHA .
+          - docker images
+          - mkdir images
+          - docker save $AWS_REPOSITORY/$APP:$CI_COMMIT_SHORT_SHA > images/$APP.tar
+  artifacts:
+    expire_in: 1h
+    paths:
+      - images
+  rules:
+          - changes:
+                  - Dockerfile
+                  - index.html
+            when: always
+          - when: always
+  tags:
+          - docker
+
+###########################################################################
+#                                TEST                                     #
+###########################################################################
+
+test:
+        stage: test
+        needs: [build]
+        services:
+                - docker:20.10.12-dind
+        script:
+                - echo "Testing web site $CI_REGISTRY_IMAGE/$APP"
+                - ls images
+                - docker load -i images/$APP.tar
+                - ls images
+                - docker images
+                - docker run -d --name $APP $AWS_REPOSITORY/$APP:$CI_COMMIT_SHORT_SHA
+                - docker ps
+                - docker exec $APP cat /usr/local/apache2/htdocs/index.html
+        tags:
+                - docker
+
+            
+###########################################################################
+#                                PUSH                                     #
+###########################################################################
+
+push_feature:
+        stage: push_feature
+        needs:
+                - build
+                - test
+        services:
+                - docker:20.10.12-dind
+        before_script:
+                - aws ecr get-login-password --region eu-west-3 | docker login --username AWS --password-stdin $AWS_REPOSITORY
+        script:
+                - docker load -i images/$APP.tar
+                - docker tag $AWS_REPOSITORY/$APP:$CI_COMMIT_SHORT_SHA $AWS_REPOSITORY/feature/$APP:latest
+                - docker images
+                - docker push $AWS_REPOSITORY/feature/$APP:latest
+        tags:
+                - docker
+        only:
+                - feature
+
+push:
+        stage: push
+        needs:
+                - build
+                - test
+        services:
+                - docker:20.10.12-dind
+        before_script:
+                - aws ecr get-login-password --region eu-west-3 | docker login --username AWS --password-stdin $AWS_REPOSITORY
+        script:
+                - docker load -i images/$APP.tar
+                - docker tag $AWS_REPOSITORY/$APP:$CI_COMMIT_SHORT_SHA $AWS_REPOSITORY/$APP:latest
+                - docker images
+                - docker push $AWS_REPOSITORY/$APP:$CI_COMMIT_SHORT_SHA
+                - docker push $AWS_REPOSITORY/$APP:latest
+        tags:
+                - docker
+        only:
+                - main
+ 
+###########################################################################
+#                               DEPLOY                                    #
+###########################################################################
+
+deploy_feature:
+        stage: deploy_feature
+        needs: [push_feature]
+        services:
+                - docker:20.10.12-dind
+        environment:
+                name: $APP
+                url: http://feature.$APP.labatest.xyz/
+        before_script:
+                - curl -Lo /usr/local/bin/ecs-cli https://amazon-ecs-cli.s3.amazonaws.com/ecs-cli-linux-amd64-latest
+                - curl -Lo ecs-cli.asc https://amazon-ecs-cli.s3.amazonaws.com/ecs-cli-linux-amd64-latest.asc
+                - chmod +x /usr/local/bin/ecs-cli
+        script:
+                - aws ecs update-service --cluster $CLUSTER_TEST --service service-feature-$APP --force-new-deployment --region $REGION | jq '.service.serviceName'
+        tags:
+                - docker
+        only:
+                - feature
+
+deploy:
+        stage: deploy
+        needs: [push]
+        services:
+                - docker:20.10.12-dind
+        environment:
+                name: $APP
+                url: http://$APP.labatest.xyz/
+        before_script:
+                - curl -Lo /usr/local/bin/ecs-cli https://amazon-ecs-cli.s3.amazonaws.com/ecs-cli-linux-amd64-latest
+                - curl -Lo ecs-cli.asc https://amazon-ecs-cli.s3.amazonaws.com/ecs-cli-linux-amd64-latest.asc
+                - chmod +x /usr/local/bin/ecs-cli
+        script:
+                - >
+
+                  TASK_DEFINTION=$(aws ecs describe-task-definition --region eu-west-3 --task-definition web-app 
+                  --query '{  containerDefinitions: taskDefinition.containerDefinitions
+                  family: taskDefinition.family
+                  taskRoleArn: taskDefinition.taskRoleArn
+                  executionRoleArn: taskDefinition.executionRoleArn
+                  networkMode: taskDefinition.networkMode
+                  volumes: taskDefinition.volumes
+                  placementConstraints: taskDefinition.placementConstraints
+                  requiresCompatibilities: taskDefinition.requiresCompatibilities
+                  cpu: taskDefinition.cpu
+                  memory: taskDefinition.memory}') 
+                - IMAGE=$AWS_REPOSITORY/$APP:$CI_COMMIT_SHORT_SHA
+                - NEW_TASK_DEFINITON=$(echo $TASK_DEFINTION | jq '.containerDefinitions[0].image = $ARG' --arg ARG $IMAGE)
+                - > 
+                        aws ecs register-task-definition --region $REGION --family $APP --cli-input-json "$NEW_TASK_DEFINITON" | 
+                        jq ".taskDefinition.containerDefinitions[].name, .taskDefinition.containerDefinitions[].image"
+                - > 
+                        aws ecs update-service --cluster $CLUSTER_PROD --service service-$APP --region $REGION
+                        --task-definition $APP --force-new-deployment | jq '.service.serviceName'
+                - ecs-cli ps --region $REGION --cluster $CLUSTER_PROD --desired-status RUNNING
+                - >
+                        TASKID=`aws ecs list-tasks --region $REGION --cluster $CLUSTER_PROD
+                        --service service-$APP | jq -r '.taskArns[]' | sed -r 's/arn:aws:ecs:eu-west-3:176927891769:task\/prod-fargate-cluster\///'` || true
+                - >
+                        aws ecs describe-tasks --cluster $CLUSTER_PROD --region $REGION 
+                        --tasks $TASKID | jq  ".tasks[] | .attachments[0].details[4], .containers[0]" || true
+
+        tags:
+                - docker
+        only:
+                - main
