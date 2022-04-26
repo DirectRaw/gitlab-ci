@@ -86,7 +86,7 @@ push_feature:
         services:
                 - docker:20.10.12-dind
         before_script:
-                - aws ecr get-login-password --region eu-west-3 | docker login --username AWS --password-stdin $AWS_REPOSITORY
+                - aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $AWS_REPOSITORY
         script:
                 - docker load -i images/$APP.tar
                 - docker tag $AWS_REPOSITORY/$APP:$CI_COMMIT_SHORT_SHA $AWS_REPOSITORY/feature/$APP:latest
@@ -105,7 +105,7 @@ push:
         services:
                 - docker:20.10.12-dind
         before_script:
-                - aws ecr get-login-password --region eu-west-3 | docker login --username AWS --password-stdin $AWS_REPOSITORY
+                - aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $AWS_REPOSITORY
         script:
                 - docker load -i images/$APP.tar
                 - docker tag $AWS_REPOSITORY/$APP:$CI_COMMIT_SHORT_SHA $AWS_REPOSITORY/$APP:latest
@@ -155,7 +155,7 @@ deploy:
         script:
                 - >
 
-                  TASK_DEFINTION=$(aws ecs describe-task-definition --region eu-west-3 --task-definition web-app 
+                  TASK_DEFINTION=$(aws ecs describe-task-definition --region $REGION --task-definition web-app 
                   --query '{  containerDefinitions: taskDefinition.containerDefinitions
                   family: taskDefinition.family
                   taskRoleArn: taskDefinition.taskRoleArn
@@ -177,7 +177,7 @@ deploy:
                 - ecs-cli ps --region $REGION --cluster $CLUSTER_PROD --desired-status RUNNING
                 - >
                         TASKID=`aws ecs list-tasks --region $REGION --cluster $CLUSTER_PROD
-                        --service service-$APP | jq -r '.taskArns[]' | sed -r 's/arn:aws:ecs:eu-west-3:176927891769:task\/prod-fargate-cluster\///'` || true
+                        --service service-$APP | jq -r '.taskArns[]' | sed -r 's/arn:aws:ecs:eu-west-3:111111111111:task\/prod-fargate-cluster\///'` || true
                 - >
                         aws ecs describe-tasks --cluster $CLUSTER_PROD --region $REGION 
                         --tasks $TASKID | jq  ".tasks[] | .attachments[0].details[4], .containers[0]" || true
